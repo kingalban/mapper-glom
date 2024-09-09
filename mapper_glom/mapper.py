@@ -12,44 +12,108 @@ from singer_sdk import _singerlib as singer
 from singer_sdk.mapper_base import InlineMapper
 
 if TYPE_CHECKING:
+    import logging
     from pathlib import PurePath
 
+TransformerSig = t.Callable[[dict[str, t.Any]], t.Any]
 
-def glom_del(record_dict: dict[str, t.Any], config: dict[str, str]) -> dict[str, t.Any]:
-    """Delete an item from a dict with Glom syntax.
-
-    Note that this MUTATES the original dict.
-    """
-    return glom.delete(record_dict, config, ignore_missing=True)
+CONFIG_KEY_MARKER = "__config_key__"
+PARTIAL_ARGS_MARKER = "__partial_args__"
 
 
-def glom_assign(
-    record_dict: dict[str, t.Any],  # noqa: ARG001
-    config: dict[str, str],  # noqa: ARG001
-) -> dict[str, t.Any]:
-    """Sets a value in a dict with Glom syntax.
+def config_key(
+    key_name: str, partial_args: list[str] | None = None
+) -> t.Callable[[t.Any], t.Any]:
+    """Annotate a function with its config key and args for the partial."""
 
-    not implemented.
-    """
-    raise NotImplementedError
+    def wrapper(func: t.Callable) -> t.Callable:
+        setattr(func, CONFIG_KEY_MARKER, key_name)
+        setattr(func, PARTIAL_ARGS_MARKER, partial_args or [])
+        return func
 
-
-def glom_get(record_dict: dict[str, t.Any], config: dict[str, str]) -> dict[str, t.Any]:  # noqa: ARG001
-    """Retrievs an item from a dict with Glom syntax.
-
-    not implemented
-    """
-    raise NotImplementedError
+    return wrapper
 
 
-GLOM_DELETE_MARKER = "__glom_del__"
-GLOM_ASSIGN_MARKER = "__glom_assign__"
-GLOM_GET_MARKER = "__glom_get__"
-MARKERS = {
-    GLOM_DELETE_MARKER: glom_del,
-    GLOM_ASSIGN_MARKER: glom_assign,
-    GLOM_GET_MARKER: glom_get,
-}
+def get_config(func: t.Callable) -> tuple[str | None, list[str] | list[None]]:
+    """Get the annotated config key and additional args for the partial."""
+    return (
+        getattr(func, CONFIG_KEY_MARKER, None),
+        getattr(func, PARTIAL_ARGS_MARKER, []),
+    )
+
+
+class Transform:
+    """Collect and prepare transforming functions as per configuration."""
+
+    def __init__(self, config: dict, logger: logging.Logger) -> None:
+        """Init the logger with the 'transformers'{...} config."""
+        self.config = config
+        self.logger = logger
+
+    @cached_property
+    def _transformers(self) -> dict[str, partial[dict[str, t.Any]]]:
+        """A mapping of stream names to transforming functions."""
+        transformers = {}
+        config_markers = self.__class__.config_markers()
+
+        for stream, config in self.config.get("transformations", {}).items():
+            marker, glom_spec = next(iter(config.items()))
+            if marker in config_markers:
+                func = getattr(self, config_markers[marker])
+                ready_func = partial(func, path=glom_spec)
+                transformers[stream] = ready_func
+                msg = (
+                    f"registered transformer for {stream=}:"
+                    f" {config_markers[marker]}(_, {glom_spec!r})"
+                )
+                self.logger.debug(msg)
+
+        return transformers
+
+    @classmethod
+    def config_markers(cls) -> dict[str, str]:
+        """A mapping of config keys to method names."""
+        _keys = {}
+        for method_name, method in cls.__dict__.items():
+            key_name, _ = get_config(method)
+            if key_name is not None:
+                _keys[key_name] = method_name
+        return _keys
+
+    def transform(self, record_message: dict[str, t.Any]) -> singer.RecordMessage:
+        """Transform the record message according to its stream name and the config."""
+        stream_name = record_message["stream"]
+
+        if stream_name in self._transformers:
+            record_message["record"] = self._transformers[stream_name](
+                record_message["record"]
+            )
+            msg = f"transforming stream {stream_name}"
+            self.logger.debug(msg)
+        return singer.RecordMessage.from_dict(record_message)
+
+    @config_key("__glom_del__")
+    def _del(
+        self, record: dict[str, t.Any], path: str, *, ignore_missing: bool = True
+    ) -> dict[str, t.Any]:
+        """Delete an item from a record.
+
+        Note: the record is mutated!
+        """
+        msg = f"deleting attribute at {path!r}"
+        self.logger.debug(msg)
+        return glom.delete(record, path, ignore_missing=ignore_missing)
+
+    @config_key("__glom_assign__")
+    def _assign(
+        self,
+        record: dict[str, t.Any],  # noqa: ARG002
+        to_path: str,
+        from_path: str,
+    ) -> dict[str, t.Any]:
+        raise NotImplementedError
+        msg = f"setting attribute at {to_path!r} from {from_path!r}"
+        self.logger.debug(msg)
 
 
 class GlomMapper(InlineMapper):
@@ -73,7 +137,7 @@ class GlomMapper(InlineMapper):
                                     "required": marker,
                                     "additionalProperties": False,
                                 }
-                                for marker in MARKERS
+                                for marker in Transform.config_markers()
                             ],
                         },
                     },
@@ -109,20 +173,7 @@ class GlomMapper(InlineMapper):
             parse_env_config=parse_env_config,
             validate_config=validate_config,
         )
-
-    @cached_property
-    def mutators(self) -> t.Mapping[str, t.Callable]:
-        """A mapping of stream names to mutating functions.
-
-        Note that these are not transformations, the record will be *mutated*
-        """
-        mutators = {}
-        for stream, config in self.config.get("transformations").items():
-            marker, glom_spec = next(iter(config.items()))
-            func = MARKERS[marker]
-            ready_func = partial(func, config=glom_spec)
-            mutators[stream] = ready_func
-        return mutators
+        self.transformer = Transform(self._config, self.logger)
 
     def map_schema_message(self, message_dict: dict) -> t.Iterable[singer.Message]:
         """Map a schema message to zero or more new messages.
@@ -143,13 +194,7 @@ class GlomMapper(InlineMapper):
         Args:
             message_dict: A RECORD message JSON dictionary.
         """
-        stream_name: str = message_dict["stream"]
-        if stream_name in self.mutators:
-            _ = self.mutators[stream_name](message_dict.get("record"))
-            yield singer.RecordMessage.from_dict(message_dict)
-
-        else:
-            yield singer.RecordMessage.from_dict(message_dict)
+        yield self.transformer.transform(message_dict)
 
     def map_state_message(self, message_dict: dict) -> t.Iterable[singer.Message]:
         """Map a state message to zero or more new messages.
